@@ -1,9 +1,9 @@
 import argparse
-import collections
 import csv
 import datetime
 import gzip
 import io
+import itertools
 import json
 import lzma
 import os
@@ -16,8 +16,6 @@ import urllib.request
 
 import lxml.etree
 import mercantile
-import shapely.geometry
-import shapely.wkt
 import overpass
 import shapely.geometry
 import shapely.wkt
@@ -48,18 +46,23 @@ COUNTRIES_IDS_SKIP = (
     1111111,
     1362232,
     1401925,
+    5466491,
 )
 
 MIN_ZOOM = 0
 MAX_ZOOM = 19
 SPLIT_ZOOM = 8
-NOT_COUNTRY_PART_STEP = 10
+
+MIN_INTERSECTION_AREA = 0.001
+MIN_INTERSECTION_AREA_PER_PERIMETER = 0.01
+MIN_GEOMETRY_AREA_PER_PERIMETER = 0.000005
 
 DUMPS_CACHE_FOLDER = 'tile_logs'
 COUNTRIES_GEOM_CACHE_FOLDER = 'countries'
 GEOM_CACHE = 'cache_geoms.picle'
-PREPROCESSED_GEOM_CACHE = 'cache_preprocessed.picle'
-SPLITED_GEOM_CACHE = 'cache_splited.picle'
+GROUPED_GEOM_CACHE = 'cache_grouped.picle'
+GROUPED_GEOM_WITH_EMPTY_CACHE = 'cache_grouped_with_empty.picle'
+SLICED_TO_TILES_GEOM_CACHE = 'cache_sliced_to_tiles.picle'
 TILE_CACHE = 'cache_tile.json'
 
 
@@ -137,6 +140,8 @@ def get_country_geom(osm_id, iso):
     else:
         _fetch(prefetch_link)
         response = _fetch(link)
+        if response.startswith('SRID=4326;'):
+            response = response[len('SRID=4326;'):]
         geom = shapely.wkt.loads(response)
         with open(file_name_wkt, 'w') as file:
             file.write(response)
@@ -210,7 +215,7 @@ def get_tile_usage_dump(link):
     return urllib.request.urlopen(link)
 
 
-def detect_country(b, x, y, z, part_zoom, part_countries, all_countries, stat):
+def detect_country(b, x, y, z, part_zoom, tiled_countries, all_countries, stat):
     twest, tsouth, teast, tnorth = b
     tgeom = shapely.geometry.box(twest, tsouth, teast, tnorth)
     result = None
@@ -222,7 +227,7 @@ def detect_country(b, x, y, z, part_zoom, part_countries, all_countries, stat):
         delta = 2 ** delta_zooms
         px = x // delta
         py = y // delta
-        countries = part_countries['%s/%s/%s' % (part_zoom, px, py)]
+        countries = tiled_countries['%s/%s/%s' % (part_zoom, px, py)]
 
     for iso, boundary, outer_box in countries:
         owest, osouth, oeast, onorth = outer_box
@@ -242,7 +247,7 @@ def detect_country(b, x, y, z, part_zoom, part_countries, all_countries, stat):
 
 
 def detect_country_with_cache(k, b, x, y, z,
-                              part_zoom, part_countries, all_countries,
+                              part_zoom, tiled_countries, all_countries,
                               min_cache_zoom, cache, stat):
     stat.in_all += 1
     if k in cache:
@@ -262,7 +267,7 @@ def detect_country_with_cache(k, b, x, y, z,
         else:
             stat.in_no_cached += 1
             country = detect_country(
-                b, px, py, pz, part_zoom, part_countries, all_countries, stat)
+                b, px, py, pz, part_zoom, tiled_countries, all_countries, stat)
             cache[k] = country
 
         if pz < z and '|' not in country:
@@ -274,14 +279,14 @@ def detect_country_with_cache(k, b, x, y, z,
     stat.in_no_cached += 1
     stat.child_zoom_equal += 1
     country = detect_country(
-        b, x, y, z, part_zoom, part_countries, all_countries, stat)
+        b, x, y, z, part_zoom, tiled_countries, all_countries, stat)
     cache[k] = country
     return country
 
 
 def process_item(out, min_cache_zoom, cache, link,
-                 part_zoom, part_countries, all_countries,
-                 min_zoom, max_zoom, remove_non_box):
+                 part_zoom, tiled_countries, all_countries,
+                 min_zoom, max_zoom, skip_empty_tiles):
     stat = Stat()
     date = get_date_from_link(link)
 
@@ -300,10 +305,10 @@ def process_item(out, min_cache_zoom, cache, link,
 
         twest, tsouth, teast, tnorth = b = mercantile.bounds(x, y, z)
         country = detect_country_with_cache(
-            path, b, x, y, z, part_zoom, part_countries, all_countries,
+            path, b, x, y, z, part_zoom, tiled_countries, all_countries,
             min_cache_zoom, cache, stat)
 
-        if remove_non_box and country == '??':
+        if skip_empty_tiles and country == '??':
             continue
 
         lat = tnorth + (tnorth - tsouth) / 2
@@ -339,133 +344,159 @@ def create_cache(part_zoom, countries, splited_countries, min_cache_zoom):
     return min_cache_zoom, cache
 
 
-def filter_geoms(x, y, z, countries):
-    twest, tsouth, teast, tnorth = mercantile.bounds(x, y, z)
-    box = shapely.geometry.box(twest, tsouth, teast, tnorth)
-    filtered_countries = []
-    for iso, geom, geom_box in countries:
-        gwest, gsouth, geast, gnorth = geom_box
-        if not (twest <= geast and teast >= gwest and
-                tnorth >= gsouth and tsouth <= gnorth):
-            continue
-        if not geom.intersects(box):
-            continue
-        geom = geom.intersection(box)
-        filtered_countries.append((iso, geom, geom.bounds))
-    Stat().log('polygons in %s/%s/%s: %s', z, x, y, len(filtered_countries))
-    return '%s/%s/%s' % (z, x, y), tuple(filtered_countries)
-
-
-def preprocess_countries(countries, remove_non_box):
-    grouped_countries = collections.defaultdict(list)
-    for iso, geom, bbox in countries.values():
-        grouped_countries[iso].append(geom)
-    Stat().log('grouped %s', len(grouped_countries))
-
-    step = NOT_COUNTRY_PART_STEP
-    negs = [[shapely.geometry.box(lat, lon, lat + step, lon + step)]
-            for lat in range(-180, 180, step)
-            for lon in range(-90, 90, step)]
-
-    splited_countries = []
-    for index, item in enumerate(grouped_countries.items()):
-        iso, geoms = item
-        geom = None
-        for geom_other in geoms:
-            if geom is None:
-                geom = geom_other.buffer(0)
-            else:
-                geom = geom.union(geom_other.buffer(0))
-
-        for j, neg in enumerate(negs):
-            if neg[0] is None or not neg[0].intersects(geom):
+def add_no_country_items(grouped_countries, tiled_countries):
+    no_country_geoms = {}
+    for tile, iso_geoms in tiled_countries.items():
+        z, x, y = tile.split('/')
+        group_divider = max(2 ** int(z) // 32, 1)
+        group_key = (int(x) // group_divider, int(y) // group_divider)
+        for iso, geom, _ in iso_geoms:
+            if iso != '??':
                 continue
-            neg[0] = neg[0].difference(geom)
-            if neg[0].is_empty:
-                neg[0] = None
-
-        so = 0
-        sb = 0
-        go = geom.area
-        gb = shapely.geometry.box(*geom.bounds).area
-        for subgeom in getattr(geom, 'geoms', [geom]):
-            so += subgeom.area
-            sb += shapely.geometry.box(*subgeom.bounds).area
-            outer_box = subgeom.bounds
-            splited_countries.append((iso, geom, outer_box))
-
-        Stat().log('{:03d} {} {:7.2f}: {:3.0f} {:8.2f} => {:7.2f}'.format(
-            index, iso, go, sb / gb * 100, gb, sb))
-
-    if remove_non_box:
-        for neg in (neg for neg in negs if neg[0] is not None):
-            for iso, geom, box in splited_countries:
-                if shapely.geometry.box(*box).intersects(shapely.geometry.box(*neg[0].bounds)):
-                    break
+            if group_key not in no_country_geoms:
+                no_country_geoms[group_key] = geom
             else:
-                neg[0] = None
+                no_country_geoms[group_key] = no_country_geoms[group_key].union(geom)
+    return grouped_countries + tuple(('??', geom, geom.bounds)
+                                     for geom in no_country_geoms.values())
 
-    for neg in (neg for neg in negs if neg[0] is not None):
-        splited_countries.append(('??', neg[0], neg[0].bounds))
 
-    return splited_countries
+def slice_geoms_to_tiles(grouped_countries):
+    tiles = {}
+    z = SPLIT_ZOOM
+    for x in range(2 ** z):
+        for y in range(2 ** z):
+            start = datetime.datetime.utcnow()
+            twest, tsouth, teast, tnorth = mercantile.bounds(x, y, z)
+            bound = shapely.geometry.box(twest, tsouth, teast, tnorth)
+            no_country_geom = shapely.geometry.box(twest, tsouth, teast, tnorth)
+            parts = []
+            for iso, geom, _ in grouped_countries:
+                if not bound.intersects(geom):
+                    continue
+                geom_part = bound.intersection(geom)
+                no_country_geom = no_country_geom.difference(geom_part)
+                parts.append((iso, geom_part))
+
+            if not no_country_geom.buffer(0).is_empty:
+                parts.append(('??', no_country_geom))
+
+            time_spent = (datetime.datetime.utcnow() - start).total_seconds()
+            Stat().log('polygons in %s/%s/%s: %s - %s%s', z, x, y,
+                       len(parts), '|'.join(iso for iso, _ in parts),
+                       '' if time_spent < 1 else (' (%s sec.)' % time_spent))
+            tiles['%s/%s/%s' % (z, x, y)] = tuple((iso, geom, geom.bounds)
+                                                  for iso, geom in parts)
+    return tiles
+
+
+def group_geoms(countries):
+    grouped_countries = {}
+    for iso, geom, bbox in countries.values():
+        geom = geom.buffer(0)
+        if iso not in grouped_countries:
+            grouped_countries[iso] = geom
+        else:
+            grouped_countries[iso] = grouped_countries[iso].union(geom)
+
+    overlapped = []
+    for iso_geom_1, iso_geom_2 in itertools.combinations(grouped_countries.items(), 2):
+        iso_1, geom_1 = iso_geom_1
+        iso_2, geom_2 = iso_geom_2
+        west_1, south_1, east_1, north_1 = geom_1.bounds
+        west_2, south_2, east_2, north_2 = geom_2.bounds
+        if not (west_1 <= east_2 and east_1 >= west_2 and
+                north_1 >= south_2 and south_1 <= north_2):
+            continue
+        if not geom_1.intersects(geom_2):
+            continue
+        intersection = geom_1.intersection(geom_2)
+        if not intersection.area or not intersection.length:
+            continue
+        area_per_perimeter = intersection.area / intersection.length
+        if (intersection.area < MIN_INTERSECTION_AREA or
+                area_per_perimeter < MIN_INTERSECTION_AREA_PER_PERIMETER):
+            continue
+        overlapped.append([iso_1, iso_2])
+        Stat().log('intersects %s and %s', iso_1, iso_2)
+
+    # only 2 geometries overlapping processed,
+    # 3 and more ignored because not found for enough big intersection
+    grouped_countries_update = {}
+    for iso_1, iso_2 in overlapped:
+        geom_1 = grouped_countries[iso_1]
+        geom_2 = grouped_countries[iso_2]
+        iso_1_2 = '+'.join(sorted([iso_1, iso_2]))
+        grouped_countries_update[iso_1_2] = geom_1.intersection(geom_2)
+
+        for iso, geom, geom_other in ((iso_1, geom_1, geom_2), (iso_2, geom_2, geom_1)):
+            geom = grouped_countries_update.get(iso, geom)
+            if geom is None:
+                continue
+            geom = geom.difference(geom_other)
+            if (geom.is_empty or not geom.area or not geom.length or
+                    geom.area / geom.length < MIN_GEOMETRY_AREA_PER_PERIMETER):
+                geom = None
+            grouped_countries_update[iso] = geom
+
+    grouped_countries.update(grouped_countries_update)
+
+    return tuple((iso, geom, geom.bounds)
+                 for iso, geom in grouped_countries.items()
+                 if geom and not geom.is_empty)
+
+
+def _cached_op(op, *args, title=None, cache=None, loader=pickle, block=True):
+    if cache and os.path.exists(cache):
+        with open(cache, 'rb' if block else 'r') as cache_file:
+            result = loader.load(cache_file)
+    else:
+        result = op(*args)
+        if cache:
+            with open(cache, 'wb' if block else 'w') as cache_file:
+                loader.dump(result, cache_file)
+    if title:
+        Stat().log('%s: %s', title, len(result))
+    return result
 
 
 def process_all(out, date_from=None, date_to=None,
                 min_zoom=None, max_zoom=None,
                 rel=None, country=None, min_cache_zoom=None):
-    if not rel and not country and os.path.exists(GEOM_CACHE):
-        full_countries = pickle.load(open(GEOM_CACHE, 'rb'))
-    else:
-        full_countries = get_countries(rel, country)
-        if not rel and not country:
-            pickle.dump(full_countries, open(GEOM_CACHE, 'wb'))
-    Stat().log('total countries: %s', len(full_countries))
-
-    if not rel and not country and os.path.exists(PREPROCESSED_GEOM_CACHE):
-        splited_countries = pickle.load(open(PREPROCESSED_GEOM_CACHE, 'rb'))
-    else:
-        splited_countries = preprocess_countries(full_countries,
-                                                 rel or country)
-        if not rel and not country:
-            pickle.dump(splited_countries, open(PREPROCESSED_GEOM_CACHE, 'wb'))
-    Stat().log('total polygons: %s', len(splited_countries))
-
-    if not rel and not country and os.path.exists(SPLITED_GEOM_CACHE):
-        part_zoom, part_countries = pickle.load(open(SPLITED_GEOM_CACHE, 'rb'))
-    else:
-        part_zoom = SPLIT_ZOOM
-        part_countries = dict(filter_geoms(x, y, part_zoom, splited_countries)
-                              for x in range(2 ** part_zoom)
-                              for y in range(2 ** part_zoom))
-        if not rel and not country:
-            pickle.dump([part_zoom, part_countries], open(SPLITED_GEOM_CACHE, 'wb'))
-    Stat().log('total parts: %s', len(part_countries))
-
-    if not rel and not country and os.path.exists(TILE_CACHE):
-        with open(TILE_CACHE) as tile_cache_file:
-            min_cache_zoom, cache = json.load(tile_cache_file)
-    else:
-        min_cache_zoom, cache = create_cache(
-            part_zoom, part_countries, splited_countries, min_cache_zoom)
+    use_cache = not rel and not country
+    full_countries = _cached_op(
+        get_countries, rel, country,
+        title='total countries', cache=use_cache and GEOM_CACHE)
+    grouped_countries = _cached_op(
+        group_geoms, full_countries,
+        title='grouped countries', cache=use_cache and GROUPED_GEOM_CACHE)
+    tiled_countries = _cached_op(
+        slice_geoms_to_tiles, grouped_countries,
+        title='total parts', cache=use_cache and SLICED_TO_TILES_GEOM_CACHE)
+    grouped_countries = _cached_op(
+        add_no_country_items, grouped_countries, tiled_countries,
+        title='grouped with empty', cache=use_cache and GROUPED_GEOM_WITH_EMPTY_CACHE)
+    min_cache_zoom, cache = _cached_op(
+        create_cache, SPLIT_ZOOM, tiled_countries, grouped_countries, min_cache_zoom,
+        cache=use_cache and TILE_CACHE, loader=json, block=False)
 
     for link in get_tile_usage_dump_links(date_from, date_to):
         process_item(out, min_cache_zoom, cache, link,
-                     part_zoom, part_countries, splited_countries,
+                     SPLIT_ZOOM, tiled_countries, grouped_countries,
                      min_zoom, max_zoom, rel or country)
-        if not rel and not country:
+        if use_cache:
             with open(TILE_CACHE, 'w') as tile_cache_file:
                 json.dump([min_cache_zoom, cache], tile_cache_file)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Fetch and concat OSM access logs.')
-    parser.add_argument('--date_from', default=None)
-    parser.add_argument('--date_to', default=None)
-    parser.add_argument('--min_zoom', type=int, default=None)
-    parser.add_argument('--max_zoom', type=int, default=None)
-    parser.add_argument('--rel', type=int, default=None)
-    parser.add_argument('--country', default=None)
+    parser = argparse.ArgumentParser(description='Fetch and concat OSM tiles access logs.')
+    parser.add_argument('--date_from', default=None, help='filter from date (min 2014-01-01)')
+    parser.add_argument('--date_to', default=None, help='filter to date (max today)')
+    parser.add_argument('--min_zoom', type=int, default=None, help='filter from zoom (min 0)')
+    parser.add_argument('--max_zoom', type=int, default=None, help='filter to zoom (max 19)')
+    parser.add_argument('--rel', type=int, default=None, help='filter by OSM relation id geometry')
+    parser.add_argument('--country', default=None, help='filter by country ISO3166 alpha 2 code OSM geometry')
     parser.add_argument('--min_cache_zoom', type=int, default=None)
     stdout = sys.stdout if sys.version_info.major == 2 else sys.stdout.buffer
     process_all(stdout, **parser.parse_args().__dict__)

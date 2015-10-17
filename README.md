@@ -1,5 +1,22 @@
 # OpenStreetMap tile usage global map kid analysis and visualisations
 
+## Detect countries for each tile
+
+    python3 fetch2.py | parallel --pipe --recend '' -k xz -9 > all-out.csv.xz
+
+Now out file contains lines similar to next:
+
+    2014-01-01,6,37,21,11270,54.2629207012382,30.9375,??|BY|RU|RU+UA|UA
+
+1. `2014-01-01` - date when log collected;
+2. `6` - tile zoom;
+3. `27` - tile x;
+4. `21` - tile y;
+5. `11270` - count of tile fetches;
+6. `54.2629207012382` - tile center latitude;
+7. `30.9375` - tile center longitude;
+8. `??|BY|RU|RU+UA|UA` - countries covered by tile `|` - split countries, `+` split two countries parts with same area in OSM, `??` - unknown counry sea, `BY` - ISO3166 alpha 2 code of country.
+
 ## Cache visualisation
 
 ![Global Map](cache_global.png)
@@ -20,3 +37,4 @@ Europe:
 
 ![Europe without tiles](cache_europe_without_tiles.png)
 ![Europe with tiles](cache_europe_with_tiles.png)
+

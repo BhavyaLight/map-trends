@@ -17,7 +17,7 @@ Now out file contains lines similar to next:
 7. `30.9375` - tile center longitude;
 8. `??|BY|RU|RU+UA|UA` - countries covered by tile `|` - split countries, `+` split two countries parts with same area in OSM, `??` - unknown counry sea, `BY` - ISO3166 alpha 2 code of country.
 
-See known counties list in OSM: http://overpass-turbo.eu/s/a27.
+See known countries list in OSM: http://overpass-turbo.eu/s/a27.
 
 ## Cache visualisation
 

@@ -43,13 +43,72 @@ BEGIN
 END
 $$ LANGUAGE plpgsql IMMUTABLE;
 
+--Fetches the neighbouring tiles
+
+--Returns an ARRAY
+CREATE OR REPLACE FUNCTION tile_neighbours(
+     Tile tile
+)RETURNS tile[]
+As $$
+DECLARE
+    neighbours tile[];
+    x CONSTANT integer=tile.x;
+    y CONSTANT integer=tile.y;
+    z CONSTANT integer=tile.z;
+BEGIN
+    neighbours=array_append(neighbours,(abs(x-1),abs(y-1),z)::tile);
+    neighbours=array_append(neighbours,(abs(x),abs(y-1),z)::tile);
+    neighbours=array_append(neighbours,(abs(x+1),abs(y-1),z)::tile);
+    neighbours=array_append(neighbours,(abs(x-1),abs(y),z)::tile);
+    neighbours=array_append(neighbours,(abs(x+1),abs(y),z)::tile);
+    neighbours=array_append(neighbours,(abs(x-1),abs(y+1),z)::tile);
+    neighbours=array_append(neighbours,(abs(x),abs(y+1),z)::tile);
+    neighbours=array_append(neighbours,(abs(x+1),abs(y+1),z)::tile);
+    RETURN ARRAY(SELECT DISTINCT UNNEST(neighbours::tile[]));
+END
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+--RETURNS A QUERY SET. NOTE: use distinct to avoid repetitive tile neighbours near edges
+CREATE OR REPLACE FUNCTION tile_neighbours_row(
+     Tile tile
+)RETURNS SETOF tile
+As $$
+DECLARE
+    x CONSTANT integer=tile.x;
+    y CONSTANT integer=tile.y;
+    z CONSTANT integer=tile.z;
+BEGIN
+    return next   (abs(x-1),abs(y-1),z)::tile;
+    return next   (abs(x),abs(y-1),z)::tile;
+    return next   (abs(x+1),abs(y-1),z)::tile;
+    return next   (abs(x-1),abs(y),z)::tile;
+    return next   (abs(x+1),abs(y),z)::tile;
+    return next   (abs(x-1),abs(y+1),z)::tile;
+    return next   (abs(x),abs(y+1),z)::tile;
+    return next   (abs(x+1),abs(y+1),z)::tile;
+    RETURN;
+END
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 --Examples
+
+--Lon/Lat to Tiles
 select * 
 from point_to_tile(ST_SetSRID(ST_point(-1,65),4326),2);
 
+--Tiles to Lon/Lat
 select st_x(ST_Transform(tile_to_point, 4326)) as lon, st_y(ST_Transform(tile_to_point, 4326)) as lat from
 (
 select *
 from tile_to_point((2,3,3))
 ) as x;
+
+--Find neighbours as array
+select * from tile_neighbours((2,2,2));
+select * from tile_neighbours((0,0,2));
+
+--Find neighbours as a query set
+select distinct * from tile_neighbours_row((2,2,2));
+select distinct * from tile_neighbours_row((0,0,2));
+
 
